@@ -35,26 +35,49 @@ class LinMotForceController:
         self.connected = self.ACI.isConnected(self.target_ip)
         return self.connected
 
-    def homing_and_enable(self, timeout=60):
-        if not self.ACI.isSwitchOnActive(self.target_ip):
-            print("Switching on drive...")
-            self.ACI.SwitchOn(self.target_ip)
+    def _get_state(self):
+        return self.ACI.getStateMachineState(self.target_ip)
+
+    def _pretty_state(self, st=None):
+        st = st if st is not None else self._get_state()
+        try:
+            return f"{st} ({int(st)})"
+        except Exception:
+            return str(st)
+
+    def ensure_drive_ready_for_motion(self, timeout=30):
+        """
+        Simple, reliable bring-up: ack errors, call SwitchOn(), wait for OperationEnabled.
+        """
+        import time
+
+        if self.ACI.isError(self.target_ip):
+            print("Acknowledging errors...")
+            self.ACI.AckErrors(self.target_ip)
+            time.sleep(0.2)
+
+        print(f"Initial drive state: {self._pretty_state()}")
+
+        t0 = time.time()
         if not self.ACI.isHomed(self.target_ip):
-            print("Starting homing procedure...")
-            homing_started = self.ACI.Homing(self.target_ip)
-            print(f"Homing started? {homing_started}")
-            t0 = time.time()
+            print("Drive is not homed. Calling Homing()...")
+            if not self.ACI.Homing(self.target_ip):
+                raise RuntimeError("Homing() call failed.")
+            print("Waiting for homing to complete...")
+    """
+            # Wait for isHomed to become True
             while not self.ACI.isHomed(self.target_ip):
                 if self.ACI.isError(self.target_ip):
-                    print("Drive reported an error during homing.")
-                    print("Error text:", self.ACI.LMcf_GetErrorTxt(self.target_ip))
-                    raise RuntimeError("Homing failed with error!")
+                    errmsg = self.ACI.getDLLError()
+                    raise RuntimeError(f"Error during homing: {errmsg}")
                 if time.time() - t0 > timeout:
-                    raise TimeoutError("Homing timed out after {} seconds.".format(timeout))
+                    raise TimeoutError("Timed out waiting for homing.")
                 time.sleep(0.5)
-        print("Drive homed!")
-        return True
 
+            print("Homing complete.")
+
+        print("Drive is Operation Enabled.")
+    """
     def set_force(self, force_n):
         return self.ACI.LMfc_ChangeTargetForce(self.target_ip, float(force_n))
 
@@ -74,7 +97,8 @@ class LinMotForceController:
         target_force_n: float,
     ) -> bool:
         """Move to a position while controlling force."""
-        return self.ACI.LMfc_GoToPosForceCtrlHighLim(
+        print("changing force now...")
+        return self.ACI.LMfc_IncrementActPosWithHigherForceCtrlLimitAndTargetForce(
             self.target_ip,
             float(position_mm),
             float(max_velocity),
@@ -83,35 +107,115 @@ class LinMotForceController:
             float(target_force_n),
         )
 
+    def ensure_force_control_ready(
+            self,
+            position_mm: float,
+            velocity: float = 0.1,
+            acceleration: float = 0.2,
+            force_limit_n: float = 20.0,
+            target_force_n: float = 200.0,
+            reset_if_needed: bool = True
+    ) -> bool:
+        """
+        Ensure the drive is in a valid state for force control.
+        If already in force mode, it updates the target force.
+        If not, it sends a force-control motion command.
+
+        Args:
+            position_mm: Position increment to apply if force control is re-triggered.
+            velocity: Velocity for the force control move.
+            acceleration: Acceleration for the force control move.
+            force_limit_n: Threshold force to switch from position to force control.
+            target_force_n: Desired target force.
+            reset_if_needed: If True, will reset into force control mode if not active.
+        Returns:
+            True if ready or successfully entered force control mode, False otherwise.
+        """
+        print("Checking force control readiness...")
+
+        if self.ACI.isError(self.target_ip):
+            error_txt = self.ACI.LMcf_GetErrorTxt(self.target_ip)
+            raise RuntimeError(f"Drive error: {error_txt}")
+
+        if self.ACI.isSpecialMotionActive(self.target_ip):
+            print("Drive is already in special motion (likely force control).")
+            print(f"Updating target force to {target_force_n} N...")
+            self.ACI.LMfc_ChangeTargetForce(self.target_ip, float(target_force_n))
+            return True
+
+        if not reset_if_needed:
+            print("Force control is not active and reset_if_needed is False — skipping reset.")
+            return False
+
+        print("Resetting force control state before reapplying...")
+        # Optionally reset force control mode safely
+        self.ACI.LMfc_GoToPosRstForceCtrlSetI(
+            self.target_ip,
+            float(position_mm - 1),
+            float(velocity),
+            float(acceleration),
+            float(acceleration),
+        )
+        time.sleep(0.2)
+
+        # Then re-engage force control mode with target force
+        print(f"Starting force control to position {position_mm} mm with {target_force_n} N...")
+        success = self.ACI.LMfc_IncrementActPosWithHigherForceCtrlLimitAndTargetForce(
+            self.target_ip,
+            float(position_mm),
+            float(velocity),
+            float(acceleration),
+            float(force_limit_n),
+            float(target_force_n),
+        )
+        return success
+
     def record_force_current_position(
-        self,
-        duration_s: int = 1800,
-        interval_s: float = 1.0,
-        csv_path: str = "linmot_data.csv",
+            self,
+            duration_s: int = 20,
+            interval_s: float = 0.1,
+            csv_path: str = "linmot_data.csv",
     ) -> None:
-        """Log force, current and position data to ``csv_path``."""
+        """Log force, current and position data to `csv_path`."""
         import csv
 
         with open(csv_path, "w", newline="") as f:
             writer = csv.writer(f)
             writer.writerow(
-                ["drive_timestamp_ms", "system_time_s", "force_raw", "position_raw", "current_raw"]
+                ["system_time","time_s", "force_raw", "current_raw", "position_raw"]
             )
             start = time.time()
             for i in range(int(duration_s // interval_s)):
                 t_sys = time.time()
-                force = self.ACI.getMonitoringChannelWithTimestamp(self.target_ip, 1)
-                position = self.ACI.getMonitoringChannelWithTimestamp(self.target_ip, 2)
+                t_elapsed = float(t_sys) - float(start)
+                # If functions with timestamp are used, monitoring channel 1 on all drives must be configured to UPID 82h (Operating Sub Hours) !
+                force = self.ACI.getMonitoringChannelWithTimestamp(self.target_ip, 2)
                 current = self.ACI.getMonitoringChannelWithTimestamp(self.target_ip, 3)
+                position = self.ACI.getMonitoringChannelWithTimestamp(self.target_ip, 4)
+
                 writer.writerow(
-                    [force.Timestamp, t_sys, force.value, position.value, current.value]
+                    [t_sys, t_elapsed, position.value, force.value, current.value]
                 )
                 elapsed = time.time() - start
                 time.sleep(max(0, interval_s * (i + 1) - elapsed))
 
+    def move_abs(self,
+        position_mm: float,
+        max_velocity: float,
+        acceleration: float,
+        deceleration: float,
+    ) -> bool:
+        return self.ACI.LMmt_MoveAbs(
+            self.target_ip,
+            float(position_mm),
+            float(max_velocity),
+            float(acceleration),
+            float(deceleration),
+        )
+
 
 if __name__ == "__main__":
-    LINMOT_DLL_PATH = r'C:\Users\12500\Downloads\LinUDP_V2_1_1_0_20210617\LinUDP\LinUDP.dll'
+    LINMOT_DLL_PATH = r'C:\Users\Shijie Sun\Desktop\Linear Motor\LinUDP_V2_1_1_0_20210617\LinUDP_V2_DLL\LinUDP.dll'
     LINMOT_TARGET_IP = "192.109.209.89"
     LINMOT_HOST_IP = "192.109.209.100"
 
@@ -122,22 +226,25 @@ if __name__ == "__main__":
                 host_ip=LINMOT_HOST_IP,
         ) as linmot:
             print("Connected to LinMot")
-            linmot.homing_and_enable()
-            print("Drive homed")
+            linmot.ensure_drive_ready_for_motion()
+            print("Drive is ready")
+            # linmot.move_abs(10,0.005,1,1)
 
-            linmot.move_with_force_limit_and_target(
-                position_mm=79.0,
-                max_velocity=0.005,
-                acceleration=1,
-                force_limit_n=50.0,
-                target_force_n=100.0,
+            linmot.ensure_force_control_ready(
+                position_mm=37,
+                velocity=0.1,
+                acceleration=0.2,
+                force_limit_n=10.0,
+                target_force_n=200.0,
+                reset_if_needed=True,
             )
+            
 
-            print("Recording force/current/position for 30 minutes...")
+            print("Recording force/current/position for 100 days...")
             linmot.record_force_current_position(
-                duration_s=20,
-                interval_s=1,
-                csv_path="linmot_data.csv",
+                duration_s=10000000,
+                interval_s=0.25,
+                csv_path="linmot_data_Test 6.csv",
             )
     except Exception as e:
         print(f"Error during experiment: {e}")
